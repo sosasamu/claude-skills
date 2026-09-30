@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Connect Obsidian vaults (Local REST API plugin) to Claude Code over MCP.
+
+Commands:
+  obsidian-mcp list                         Show vaults, plugin status, ports and keychain status
+  obsidian-mcp sync                         Assign unique ports per vault and store API keys in the Keychain
+  obsidian-mcp add <project-dir> <vault>... Add vaults as MCP servers to <project-dir>/.mcp.json
+  obsidian-mcp headers <vault>              Print the Authorization header (used by Claude Code's headersHelper)
+
+Never prints API keys or certificates.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+OBSIDIAN_CONFIG = Path.home() / "Library/Application Support/obsidian/obsidian.json"
+PLUGIN_DATA = Path(".obsidian/plugins/obsidian-local-rest-api/data.json")
+KEYCHAIN_PREFIX = "obsidian-api-key-"
+FIRST_PORT = 27123
+ACCOUNT = os.environ.get("USER", "")
+
+
+def fail(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def load_vaults() -> list[dict]:
+    if not OBSIDIAN_CONFIG.exists():
+        fail(f"no se encontró {OBSIDIAN_CONFIG}")
+    raw = json.loads(OBSIDIAN_CONFIG.read_text())["vaults"].values()
+    vaults = []
+    for entry in raw:
+        path = Path(entry["path"])
+        data_file = path / PLUGIN_DATA
+        vaults.append({
+            "slug": slugify(path.name),
+            "path": path,
+            "data_file": data_file,
+            "data": json.loads(data_file.read_text()) if data_file.exists() else None,
+        })
+    slugs = [v["slug"] for v in vaults]
+    duplicates = {s for s in slugs if slugs.count(s) > 1}
+    if duplicates:
+        fail(f"hay vaults con el mismo nombre de carpeta: {', '.join(sorted(duplicates))}")
+    return vaults
+
+
+def find_vault(vaults: list[dict], slug: str) -> dict:
+    for vault in vaults:
+        if vault["slug"] == slug:
+            return vault
+    fail(f"vault '{slug}' no existe. Usa 'obsidian-mcp list' para ver los nombres")
+
+
+def keychain_service(slug: str) -> str:
+    return KEYCHAIN_PREFIX + slug
+
+
+def keychain_read(slug: str) -> str | None:
+    result = subprocess.run(
+        ["security", "find-generic-password", "-a", ACCOUNT, "-s", keychain_service(slug), "-w"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def keychain_write(slug: str, secret: str) -> None:
+    # Secret goes through stdin (entered twice, as `security` asks) so it never shows up in `ps`.
+    result = subprocess.run(
+        ["security", "add-generic-password", "-U", "-a", ACCOUNT, "-s", keychain_service(slug), "-w"],
+        input=f"{secret}\n{secret}\n", capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        fail(f"no se pudo guardar la key de '{slug}' en el Llavero")
+
+
+def obsidian_running() -> bool:
+    return subprocess.run(["pgrep", "-x", "Obsidian"], capture_output=True).returncode == 0
+
+
+def assign_ports(vaults: list[dict]) -> dict[str, tuple[int, int]]:
+    """Return {slug: (http_port, https_port)} with no collisions, keeping existing ports when possible."""
+    with_plugin = sorted(
+        (v for v in vaults if v["data"] is not None),
+        key=lambda v: v["data"].get("insecurePort", FIRST_PORT),
+    )
+    used: set[int] = set()
+    assigned = {}
+    conflicting = []
+    for vault in with_plugin:
+        http = vault["data"].get("insecurePort", FIRST_PORT)
+        https = vault["data"].get("port", FIRST_PORT + 1)
+        if http in used or https in used or http == https:
+            conflicting.append(vault)
+            continue
+        used.update({http, https})
+        assigned[vault["slug"]] = (http, https)
+    for vault in conflicting:
+        http = FIRST_PORT
+        while http in used or http + 1 in used:
+            http += 2
+        used.update({http, http + 1})
+        assigned[vault["slug"]] = (http, http + 1)
+    return assigned
+
+
+def write_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def cmd_list(vaults: list[dict]) -> None:
+    print(f"{'VAULT':<28} {'PLUGIN':<7} {'HTTP':<6} {'HTTPS':<6} {'HTTP ON':<8} LLAVERO")
+    for vault in vaults:
+        data = vault["data"]
+        if data is None:
+            print(f"{vault['slug']:<28} {'no':<7}")
+            continue
+        in_keychain = keychain_read(vault["slug"]) == data.get("apiKey")
+        print(
+            f"{vault['slug']:<28} {'sí':<7} {data.get('insecurePort', '-')!s:<6} {data.get('port', '-')!s:<6} "
+            f"{'sí' if data.get('enableInsecureServer') else 'no':<8} {'ok' if in_keychain else 'falta'}"
+        )
+
+
+def cmd_sync(vaults: list[dict]) -> None:
+    ports = assign_ports(vaults)
+    pending = []
+    for vault in vaults:
+        data = vault["data"]
+        if data is None:
+            print(f"- {vault['slug']}: sin plugin, se ignora (instálalo desde Obsidian)")
+            continue
+        http, https = ports[vault["slug"]]
+        if (data.get("insecurePort"), data.get("port"), data.get("enableInsecureServer")) != (http, https, True):
+            pending.append((vault, http, https))
+        api_key = data.get("apiKey")
+        if not api_key:
+            print(f"- {vault['slug']}: el plugin aún no generó API key, ábrelo una vez en Obsidian")
+            continue
+        if keychain_read(vault["slug"]) != api_key:
+            keychain_write(vault["slug"], api_key)
+            print(f"- {vault['slug']}: key guardada en el Llavero ({keychain_service(vault['slug'])})")
+
+    if not pending:
+        print("Puertos OK, no hay cambios pendientes.")
+        return
+    for vault, http, https in pending:
+        print(f"- {vault['slug']}: puertos -> HTTP {http} / HTTPS {https}, servidor HTTP activado")
+    if obsidian_running():
+        print("\nObsidian está abierto: no se escribió nada (sobrescribiría el cambio al cerrarse).")
+        print("Cierra Obsidian por completo (⌘Q) y vuelve a ejecutar 'obsidian-mcp sync'.")
+        sys.exit(1)
+    for vault, http, https in pending:
+        vault["data"].update({"insecurePort": http, "port": https, "enableInsecureServer": True})
+        write_json(vault["data_file"], vault["data"])
+    print("\nPuertos actualizados. Si ya tenías proyectos configurados, vuelve a ejecutar 'obsidian-mcp add' en ellos.")
+
+
+def warn_if_tracked(project: Path, mcp_file: Path) -> None:
+    inside_git = subprocess.run(["git", "-C", str(project), "rev-parse"], capture_output=True).returncode == 0
+    if not inside_git:
+        return
+    ignored = subprocess.run(["git", "-C", str(project), "check-ignore", "-q", str(mcp_file)]).returncode == 0
+    if not ignored:
+        print(f"aviso: {mcp_file} no está en .gitignore; contiene rutas locales de tu máquina.")
+
+
+def cmd_add(vaults: list[dict], project_dir: str, slugs: list[str]) -> None:
+    project = Path(project_dir).expanduser().resolve()
+    if not project.is_dir():
+        fail(f"'{project}' no es una carpeta")
+    if not slugs:
+        fail("indica al menos un vault. Usa 'obsidian-mcp list' para ver los nombres")
+    selected = [find_vault(vaults, slug) for slug in slugs]
+    missing_plugin = [v["slug"] for v in selected if v["data"] is None]
+    if missing_plugin:
+        fail(f"sin plugin instalado: {', '.join(missing_plugin)}")
+
+    mcp_file = project / ".mcp.json"
+    config = json.loads(mcp_file.read_text()) if mcp_file.exists() else {}
+    servers = config.setdefault("mcpServers", {})
+    script = Path(__file__).resolve()
+    for vault in selected:
+        name = f"obsidian-{vault['slug']}"
+        servers[name] = {
+            "type": "http",
+            "url": f"http://127.0.0.1:{vault['data']['insecurePort']}/mcp",
+            "headersHelper": f"{script} headers {vault['slug']}",
+        }
+        print(f"- {name} -> {servers[name]['url']}")
+    write_json(mcp_file, config)
+    print(f"Actualizado {mcp_file}")
+    warn_if_tracked(project, mcp_file)
+
+
+def cmd_headers(slug: str) -> None:
+    secret = keychain_read(slug)
+    if secret is None:
+        fail(f"no hay key para '{slug}' en el Llavero. Ejecuta 'obsidian-mcp sync'")
+    print(json.dumps({"Authorization": f"Bearer {secret}"}))
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    command, rest = args[0], args[1:]
+    if command == "headers" and len(rest) == 1:
+        cmd_headers(rest[0])
+        return
+    vaults = load_vaults()
+    if command == "list":
+        cmd_list(vaults)
+    elif command == "sync":
+        cmd_sync(vaults)
+    elif command == "add" and rest:
+        cmd_add(vaults, rest[0], rest[1:])
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
