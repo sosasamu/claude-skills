@@ -2,20 +2,23 @@
 // qcheck: runs tests, lint and typecheck and prints only what Claude needs to act on.
 // The full output is kept in a log file (inside .git/qcheck) so it can be grepped on demand.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, extname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 
 const USAGE = `qcheck: tests, lint y typecheck con salida compacta
 
 Uso:
   qcheck test  [opciones] [-- args para vitest/jest]
+  qcheck e2e   [opciones] [-- args para playwright test]
   qcheck lint  [opciones] [-- archivos o args para eslint]   (por defecto: .)
   qcheck types [opciones] [-- args para tsc]
   qcheck all   [opciones]                                     (lint + types + test)
+  qcheck run   [--until <regex>] [--timeout <s>] -- <comando> (igual que qrun)
   qcheck hook                                                 (PostToolUse de Claude Code; lee JSON por stdin)
+  qcheck guard                                                (PreToolUse de Claude Code; lee JSON por stdin)
 
 Opciones:
   --baseline     Si hay fallos, compara con la rama base (git worktree, cacheado por commit)
@@ -26,6 +29,21 @@ Opciones:
 Salida: una línea por check si pasa; si falla, solo los errores y la ruta del log completo.
 Código de salida: 0 si todo pasa (o, con --baseline, si no hay fallos nuevos); 1 si no.`;
 
+const RUN_USAGE = `qrun: corre cualquier comando y muestra solo el resultado o los errores
+
+Uso:
+  qrun [--until <regex>] [--timeout <s>] [--] <comando...>
+
+  qrun -- pnpm build
+  qrun -- "docker compose build && docker compose up -d"
+  qrun --until "listening on|ready in" --timeout 60 -- pnpm dev
+
+--until    Para procesos que no terminan (dev servers): espera a que una línea coincida, lo detiene y reporta.
+--timeout  Segundos máximos (por defecto: sin límite; con --until, 120).
+
+Salida: ✓ y la última línea si sale bien; si falla, las líneas con errores (con contexto) y el final del log.
+El log completo queda en .git/qcheck/run-<comando>.log.`;
+
 const CODE_EXT = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]);
 const TS_EXT = new Set([".ts", ".tsx", ".mts", ".cts"]);
 const MESSAGE_LINES = 12;
@@ -34,12 +52,12 @@ const NOISE_FRAME = /node_modules|node:internal|\(node:|<anonymous>/;
 
 // ---------- helpers ----------
 
-function run(cmd, args, cwd) {
+function run(cmd, args, cwd, env = {}) {
   const result = spawnSync(cmd, args, {
     cwd,
     encoding: "utf8",
     maxBuffer: 512 * 1024 * 1024,
-    env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
+    env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1", ...env },
   });
   const out = `${result.stdout ?? ""}${result.stderr ?? ""}${result.error ? `\n${result.error.message}` : ""}`;
   return { code: result.status ?? 1, out: out.replace(ANSI, "") };
@@ -184,6 +202,56 @@ function checkTest(ctx) {
   return { kind: "test", ok, log, failures, headline: parts.join(" · ") };
 }
 
+// ---------- e2e (playwright) ----------
+
+function checkE2e(ctx) {
+  const { cwd, extra, dir, prefix, root } = ctx;
+  const bin = readDeps(cwd).deps.has("@playwright/test") && findBin("playwright", cwd);
+  if (!bin) return { kind: "e2e", ok: true, skipped: true, headline: "sin @playwright/test", failures: [] };
+
+  const report = join(dir, `${prefix}report-e2e.json`);
+  rmSync(report, { force: true });
+  const started = Date.now();
+  const result = run(bin, ["test", "--reporter=json", ...extra], cwd, { PLAYWRIGHT_JSON_OUTPUT_NAME: report });
+  const elapsed = seconds(Date.now() - started);
+  const log = saveLog(dir, prefix, "e2e", result.out);
+  if (!existsSync(report)) {
+    return { kind: "e2e", ok: false, crashed: true, log, failures: [], headline: `playwright terminó sin reporte (código ${result.code})`, detail: tail(result.out, 30, root) };
+  }
+
+  const data = JSON.parse(readFileSync(report, "utf8"));
+  const testDir = data.config?.rootDir ?? cwd;
+  const failures = [];
+  const walk = (suite, titles) => {
+    for (const spec of suite.specs ?? []) {
+      for (const test of spec.tests ?? []) {
+        if (test.status !== "unexpected") continue;
+        const file = relative(root, resolve(testDir, spec.file));
+        const name = [...titles, spec.title].join(" > ");
+        const project = test.projectName ? ` [${test.projectName}]` : "";
+        const last = test.results?.at(-1);
+        const message = (last?.errors ?? [last?.error]).filter(Boolean).map((error) => error.message ?? "").join("\n");
+        failures.push({ id: `${file} > ${name}${project}`, title: `${file}:${spec.line} > ${name}${project}`, detail: trimMessage(message, root) });
+      }
+    }
+    for (const child of suite.suites ?? []) walk(child, [...titles, child.title]);
+  };
+  // top-level suites are files; their title is the file name, already shown in the path
+  for (const fileSuite of data.suites ?? []) walk(fileSuite, []);
+
+  const globalErrors = (data.errors ?? []).map((error) => error.message ?? "").join("\n");
+  if (!failures.length && (result.code !== 0 || globalErrors)) {
+    return { kind: "e2e", ok: false, crashed: true, log, failures, headline: `código ${result.code} sin tests fallidos`, detail: trimMessage(globalErrors || result.out.split("\n").slice(-30).join("\n"), root) };
+  }
+  const stats = data.stats ?? {};
+  const parts = [`${stats.expected ?? 0} pasaron`];
+  if (failures.length) parts.unshift(`${failures.length} fallaron`);
+  if (stats.flaky) parts.push(`${stats.flaky} flaky`);
+  if (stats.skipped) parts.push(`${stats.skipped} omitidos`);
+  parts.push(elapsed);
+  return { kind: "e2e", ok: failures.length === 0, log, failures, headline: parts.join(" · ") };
+}
+
 // ---------- lint (eslint) ----------
 
 function checkLint(ctx) {
@@ -284,7 +352,7 @@ function checkGeneric(ctx, kind, pkgDir) {
   };
 }
 
-const CHECKS = { test: checkTest, lint: checkLint, types: checkTypes };
+const CHECKS = { test: checkTest, e2e: checkE2e, lint: checkLint, types: checkTypes };
 
 // ---------- baseline (git worktree, cached per merge-base commit) ----------
 
@@ -509,6 +577,202 @@ function hook() {
   return 2;
 }
 
+// ---------- qrun: any command ----------
+
+const ERROR_LINE = /\b(errors?|failed|failure|fatal|exception|panic|traceback|denied|refused|cannot|unable to|not found)\b|\bERR!|\bERR_\w+|✖|✗|×/i;
+const WARNING_LINE = /\bwarn(ing)?s?\b/i;
+
+function cleanOutput(text) {
+  // progress bars rewrite the line with \r; keep only what was finally shown
+  return text
+    .replace(ANSI, "")
+    .split("\n")
+    .map((line) => line.split("\r").filter(Boolean).at(-1) ?? "")
+    .join("\n");
+}
+
+function shellQuote(arg) {
+  return /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+function runShell(command, cwd, until, timeoutMs) {
+  return new Promise((done) => {
+    const child = spawn("sh", ["-c", command], {
+      cwd,
+      detached: true, // own process group, so dev servers and their children can be stopped together
+      env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
+    });
+    let out = "";
+    let pending = "";
+    let matched = null;
+    let timedOut = false;
+    let killTimer = null;
+    const stop = () => {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {}
+      killTimer = setTimeout(() => {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {}
+      }, 5000);
+    };
+    const onData = (chunk) => {
+      out += chunk;
+      if (!until || matched) return;
+      const lines = (pending + chunk).replace(ANSI, "").split(/\r?\n/);
+      pending = lines.pop();
+      matched = lines.find((line) => until.test(line)) ?? null;
+      if (matched) stop();
+    };
+    child.stdout.setEncoding("utf8").on("data", onData);
+    child.stderr.setEncoding("utf8").on("data", onData);
+    const timer = timeoutMs ? setTimeout(() => { timedOut = !matched; stop(); }, timeoutMs) : null;
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      done({ code: code ?? 1, out: cleanOutput(out), matched: matched?.trim(), timedOut });
+    });
+  });
+}
+
+// Collapses runs of identical lines ("tick" ×200) into one.
+function collapseRepeats(lines) {
+  const output = [];
+  for (const line of lines) {
+    const last = output.at(-1);
+    if (last && last.text === line) last.count += 1;
+    else output.push({ text: line, count: 1 });
+  }
+  return output.map(({ text, count }) => (count > 1 ? `${text} (×${count})` : text));
+}
+
+function errorExcerpt(lines, maxLines) {
+  const shown = new Set();
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!ERROR_LINE.test(lines[i])) continue;
+    for (let j = Math.max(0, i - 2); j <= Math.min(lines.length - 1, i + 4); j += 1) shown.add(j);
+  }
+  const indexes = [...shown].filter((i) => lines[i].trim()).sort((a, b) => a - b);
+  const output = [];
+  let previous = -2;
+  for (const i of indexes.slice(0, maxLines)) {
+    const skipped = lines.slice(previous + 1, i).some((line) => line.trim());
+    if (skipped && output.length) output.push("    ⋮");
+    output.push(`    ${lines[i].trimEnd()}`);
+    previous = i;
+  }
+  if (indexes.length > maxLines) output.push(`    … (+${indexes.length - maxLines} líneas con errores, ver log)`);
+  return { output, shown: new Set(indexes.slice(0, maxLines)) };
+}
+
+async function qrun(argv) {
+  let until = null;
+  let timeout = null;
+  let i = 0;
+  for (; i < argv.length; i += 1) {
+    if (argv[i] === "--until") until = new RegExp(argv[++i], "i");
+    else if (argv[i] === "--timeout") timeout = Number(argv[++i]);
+    else if (argv[i] === "--") {
+      i += 1;
+      break;
+    } else break;
+  }
+  const words = argv.slice(i);
+  if (!words.length || words[0] === "-h" || words[0] === "--help") {
+    console.log(RUN_USAGE);
+    return words.length ? 0 : 1;
+  }
+  const command = words.length === 1 ? words[0] : words.map(shellQuote).join(" ");
+  const cwd = process.cwd();
+  const dir = stateDir(cwd);
+  const timeoutMs = (timeout ?? (until ? 120 : 0)) * 1000;
+
+  const started = Date.now();
+  const result = await runShell(command, cwd, until, timeoutMs);
+  const elapsed = seconds(Date.now() - started);
+  const slug = command.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").slice(0, 40) || "cmd";
+  const log = shortPath(saveLog(dir, "", `run-${slug}`, result.out), cwd);
+  const lines = result.out.split("\n");
+  const label = command.length > 60 ? `${command.slice(0, 57)}…` : command;
+
+  if (result.matched) {
+    console.log(`✓ ${label} · listo en ${elapsed} (detenido) · log: ${log}`);
+    console.log(`    ${result.matched}`);
+    return 0;
+  }
+  if (!until && !result.timedOut && result.code === 0) {
+    const warnings = lines.filter((line) => WARNING_LINE.test(line)).length;
+    const last = lines.filter((line) => line.trim()).at(-1)?.trim();
+    console.log(`✓ ${label} · ${elapsed}${warnings ? ` · ${warnings} líneas con warning` : ""} · log: ${log}`);
+    if (last) console.log(`    ${last.length > 200 ? `${last.slice(0, 197)}…` : last}`);
+    return 0;
+  }
+
+  const reason = result.timedOut
+    ? `sin terminar${until ? ` ni coincidir con /${until.source}/` : ""} en ${timeoutMs / 1000}s (detenido)`
+    : until
+      ? `terminó (código ${result.code}) antes de coincidir con /${until.source}/`
+      : `código ${result.code}`;
+  console.log(`✗ ${label} · ${reason} · ${elapsed} · log: ${log}`);
+  const { output, shown } = errorExcerpt(lines, 40);
+  if (output.length) console.log(collapseRepeats(output).join("\n"));
+  const tailIndexes = lines.map((_, index) => index).filter((index) => lines[index].trim() && !shown.has(index)).slice(-200);
+  if (tailIndexes.length) {
+    console.log("  Final del log:");
+    console.log(collapseRepeats(tailIndexes.map((index) => `    ${lines[index].trimEnd()}`)).slice(-15).join("\n"));
+  }
+  return 1;
+}
+
+// ---------- guard (PreToolUse on Bash) ----------
+
+const PM = "(?:pnpm|npm|yarn|bun)";
+const EXEC = "(?:(?:npx|pnpm exec|pnpm dlx|yarn|bunx) )?";
+const REDIRECTS = [
+  { re: new RegExp(`^(?:${EXEC}playwright test|${PM}(?: run)? (?:test:)?e2e)\\b`), use: "qcheck e2e [-- args]" },
+  { re: new RegExp(`^(?:${EXEC}(?:vitest|jest)|${PM}(?: run)? test|${PM} t)(?:\\s|$)`), use: "qcheck test [-- archivos o args]" },
+  { re: new RegExp(`^(?:${EXEC}eslint|${PM}(?: run)? lint)(?:\\s|$)`), use: "qcheck lint [-- archivos]" },
+  { re: new RegExp(`^(?:${EXEC}tsc|${PM}(?: run)? (?:typecheck|type-check|tsc))(?:\\s|$)`), use: "qcheck types" },
+  {
+    re: new RegExp(
+      `^(?:${PM}(?: run)? build|${PM} (?:install|i|ci|add)|yarn$|docker (?:build|compose (?:up|build))|(?:\\./)?gradlew|xcodebuild|pod install|${EXEC}(?:expo prebuild|cdk (?:synth|diff)|prisma (?:generate|migrate)|nest build|next build|vite build)|terraform (?:plan|init))\\b`,
+    ),
+    use: "qrun -- <comando>",
+  },
+];
+const HARMLESS = /\s(?:--version|-v|--help|-h)\b/;
+
+function commandSegments(command) {
+  return command
+    .split(/&&|\|\||;|\|/)
+    .map((segment) => segment.trim().replace(/^(?:cd \S+\s*)$/, "").replace(/^(?:\w+=\S*\s+)+/, ""));
+}
+
+function guard() {
+  let input = {};
+  try {
+    input = JSON.parse(readFileSync(0, "utf8") || "{}");
+  } catch {
+    return 0;
+  }
+  const command = input.tool_input?.command ?? "";
+  if (!command || /\bQCHECK_RAW=1\b/.test(command)) return 0;
+  for (const segment of commandSegments(command)) {
+    if (!segment || /^(?:qcheck|qrun)\b/.test(segment) || HARMLESS.test(` ${segment}`)) continue;
+    const rule = REDIRECTS.find(({ re }) => re.test(segment));
+    if (!rule) continue;
+    const suggestion = rule.use.startsWith("qrun") ? `qrun -- ${segment.replace(/\s*\d?>&?\s*\S+/g, "")}` : rule.use;
+    console.error(
+      `qcheck guard: \`${segment}\` imprime el output completo. Usá \`${suggestion}\` (skill quiet-checks): muestra solo errores o ✓ y guarda el log.` +
+        (rule.use.startsWith("qcheck") ? " Agregá --baseline para separar fallos nuevos de preexistentes." : "") +
+        " Si el usuario pidió explícitamente el output completo, anteponé QCHECK_RAW=1.",
+    );
+    return 2;
+  }
+  return 0;
+}
+
 // ---------- main ----------
 
 function parseArgs(argv) {
@@ -525,9 +789,12 @@ function parseArgs(argv) {
   return options;
 }
 
-function main() {
+async function main() {
   const [command, ...rest] = process.argv.slice(2);
+  if (basename(process.argv[1]) === "qrun") return qrun(process.argv.slice(2));
+  if (command === "run") return qrun(rest);
   if (command === "hook") return hook();
+  if (command === "guard") return guard();
 
   const kinds = command === "all" ? ["lint", "types", "test"] : CHECKS[command] ? [command] : null;
   const options = kinds && parseArgs(rest);
@@ -549,4 +816,4 @@ function main() {
   return ok ? 0 : 1;
 }
 
-process.exitCode = main();
+process.exitCode = await main();
