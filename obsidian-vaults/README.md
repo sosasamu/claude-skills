@@ -32,7 +32,7 @@ obsidian-vaults/
 Enlaza la carpeta a tus skills personales de Claude Code:
 
 ```bash
-ln -s ~/Proyects/obsidian-claude-skills/obsidian-vaults ~/.claude-personal/skills/obsidian-vaults
+ln -s ~/Proyects/claude-skills/obsidian-vaults ~/.claude-personal/skills/obsidian-vaults
 ```
 
 (Si usas la configuración por defecto de Claude Code, la carpeta es `~/.claude/skills/`.)
@@ -40,7 +40,7 @@ ln -s ~/Proyects/obsidian-claude-skills/obsidian-vaults ~/.claude-personal/skill
 Opcional, para usar el script directamente desde la terminal:
 
 ```bash
-ln -sf ~/Proyects/obsidian-claude-skills/obsidian-vaults/scripts/obsidian-mcp ~/.local/bin/obsidian-mcp
+ln -sf ~/Proyects/claude-skills/obsidian-vaults/scripts/obsidian-mcp ~/.local/bin/obsidian-mcp
 ```
 
 ## Uso con Claude
@@ -94,7 +94,7 @@ Resultado en `.mcp.json`:
     "obsidian-byrrgis-vault": {
       "type": "http",
       "url": "http://127.0.0.1:27123/mcp",
-      "headersHelper": "/Users/samuel/Proyects/obsidian-claude-skills/obsidian-vaults/scripts/obsidian-mcp headers byrrgis-vault"
+      "headersHelper": "/Users/samuel/Proyects/claude-skills/obsidian-vaults/scripts/obsidian-mcp headers byrrgis-vault"
     }
   }
 }
