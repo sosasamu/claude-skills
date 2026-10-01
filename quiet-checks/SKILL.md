@@ -1,7 +1,7 @@
 ---
 name: quiet-checks
-description: Run tests, lint and typecheck in JavaScript/TypeScript projects with compact output (only failures, or one ✓ line), and tell new failures apart from ones that already existed on the base branch without stashing. Use this skill whenever you are about to run or re-run tests, eslint, tsc, `pnpm test`, `pnpm lint`, vitest or jest, validate changes before finishing a task, or check whether a failure was caused by the current changes — even if the user just says "corré los tests", "fijate si pasa el lint" or "¿esto ya fallaba antes?".
-compatibility: Node 18+, git. Detects vitest/jest, eslint and tsc from the project's node_modules; falls back to the package.json "test" script.
+description: Run tests, e2e, lint, typecheck and any noisy command (build, install, docker, gradle, cdk, migrations, dev servers) with compact output — only failures or one ✓ line, full log kept aside — and tell new test failures apart from ones that already existed on the base branch without stashing. Use this skill whenever you are about to run or re-run tests, playwright, eslint, tsc, `pnpm test`, `pnpm lint`, `pnpm build`, `pnpm install`, docker builds, native builds, or start a dev server to see if it boots; when validating changes before finishing a task; or when checking whether a failure was caused by the current changes — even if the user just says "corré los tests", "fijate si buildea", "levantá la app" or "¿esto ya fallaba antes?".
+compatibility: Node 18+, git. Detects vitest/jest, playwright, eslint and tsc from the project's node_modules; falls back to the package.json "test" script.
 ---
 
 # Quiet checks
@@ -23,6 +23,7 @@ Run it as `<skill-dir>/scripts/qcheck.mjs` or `qcheck` if it's on the PATH, from
 | Command | Use it for |
 |---|---|
 | `qcheck test [-- args]` | Tests. Args after `--` go to vitest/jest, e.g. `-- src/math.test.ts` or `-- -t "adds"`. |
+| `qcheck e2e [-- args]` | Playwright tests (`-- e2e/login.spec.ts`, `-- -g "checkout"`). Not part of `all`: run it when the change touches flows the e2e suite covers. |
 | `qcheck lint [-- files]` | ESLint errors grouped by rule (warnings only counted). Default target `.`. |
 | `qcheck types` | `tsc --noEmit`, errors grouped by message. |
 | `qcheck all` | lint + types + test. Use it once before declaring a task done. |
@@ -39,9 +40,28 @@ Exit code: 0 when everything passes (or, with `--baseline`, when there are no ne
 - **Read the log only when the summary isn't enough** (e.g. a truncated message marked `… (+N líneas)`). Search it instead of reading it whole: `grep -n -A 20 "test name" .git/qcheck/last-test.log`. The JSON reports next to it (`report-test.json`, `report-lint.json`) have every detail.
 - **Crashes** (`terminó sin reporte`, `eslint falló`, `tsc falló`) mean the tool itself couldn't run: config errors, missing deps, syntax errors in config. The summary shows the last lines of output; fix that first.
 
-## Edit hook
+## Any other noisy command: `qrun`
 
-If the user has enabled the hook (see README), every time you edit a JS/TS file, Claude Code runs ESLint on that file and `tsc` (incremental) filtered to that file. If there are errors, they arrive right after the edit as a short list; fix them before moving on. No message means the file is clean. Don't re-run lint/types manually after each edit when the hook is on.
+For commands that aren't tests/lint/types but print a lot — builds, installs, docker, Gradle/Xcode/CocoaPods, `expo prebuild`, `cdk synth`/`diff`, `terraform plan`, migrations — use `qrun` (same script; `qcheck run` works too):
+
+```
+qrun -- pnpm build
+qrun -- "docker compose build && docker compose up -d"
+qrun --until "listening on|ready in|compiled successfully" --timeout 90 -- pnpm dev
+```
+
+- On success: `✓`, elapsed time, a count of warning lines and the last output line (usually the tool's own summary).
+- On failure: the lines that look like errors with a bit of context, plus the end of the log, repeated lines collapsed. If the excerpt doesn't explain the failure, `grep` the log it points to.
+- `--until <regex>` is for processes that never exit (dev servers, watchers): it waits for a matching line, stops the process (and its children) and reports ✓; if the process dies first or `--timeout` passes, it reports the errors. Use it to check that an app boots instead of running the server in the foreground.
+- `cdk synth` prints the whole template; `qrun` keeps it in the log. Prefer `cdk diff` to see what changes.
+
+## Hooks
+
+**Guard (PreToolUse).** If the user enabled it, running `pnpm test`, `vitest`, `eslint`, `tsc`, `pnpm build`, `pnpm install`, docker builds, etc. directly is blocked with a message telling you which `qcheck`/`qrun` command to use instead — just run that. Only when the user explicitly asks to see the raw output, prefix the command with `QCHECK_RAW=1` to bypass it.
+
+**Edit hook (PostToolUse).**
+
+If the user has enabled it, every time you edit a JS/TS file, Claude Code runs ESLint on that file and `tsc` (incremental) filtered to that file. If there are errors, they arrive right after the edit as a short list; fix them before moving on. No message means the file is clean. Don't re-run lint/types manually after each edit when the hook is on.
 
 ## Where things live
 

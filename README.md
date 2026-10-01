@@ -4,7 +4,7 @@ Skills de Claude Code.
 
 | Skill | Para qué |
 |---|---|
-| [`quiet-checks`](quiet-checks/README.md) | Correr tests, lint y typecheck gastando pocos tokens: solo los fallos, log completo aparte, comparación con la rama base sin stash y hook al editar. |
+| [`quiet-checks`](quiet-checks/README.md) | Correr tests, e2e, lint, typecheck y comandos ruidosos (build, install, docker, dev servers) gastando pocos tokens: solo los fallos, log completo aparte, comparación con la rama base sin stash y hooks opcionales. |
 | [`obsidian-vaults`](obsidian-vaults/README.md) | Conectar vaults de Obsidian a proyectos por MCP: puertos únicos, keys en el Llavero, `.mcp.json` sin secretos, diagnóstico de errores (401, failed). |
 | [`obsidian-notes`](obsidian-notes/SKILL.md) | Trabajar con las notas de Obsidian una vez conectado: elegir vault, respetar convenciones, editar por secciones, mover sin romper enlaces, confirmar antes de borrar. |
 
@@ -23,6 +23,7 @@ ln -s ~/Proyects/claude-skills/obsidian-notes  ~/.claude-personal/skills/obsidia
 
 # Opcional: los scripts en el PATH
 ln -sf ~/Proyects/claude-skills/quiet-checks/scripts/qcheck.mjs ~/.local/bin/qcheck
+ln -sf ~/Proyects/claude-skills/quiet-checks/scripts/qcheck.mjs ~/.local/bin/qrun
 ln -sf ~/Proyects/claude-skills/obsidian-vaults/scripts/obsidian-mcp ~/.local/bin/obsidian-mcp
 ```
 
