@@ -28,6 +28,7 @@ Run it as `<skill-dir>/scripts/qcheck.mjs` or `qcheck` if it's on the PATH, from
 | `qcheck types` | `tsc --noEmit`, errors grouped by message. |
 | `qcheck all` | lint + types + test. Use it once before declaring a task done. |
 | `--baseline` | When something fails, also runs the same check on the merge-base with the base branch and splits failures into new vs pre-existing. |
+| `--timeout <s>` | Stop the check and all its processes after this long (default 540s, or `QCHECK_TIMEOUT`). |
 | `--base <ref>` / `--max <n>` | Base branch. Default: the branch the current one was created from (read from the local reflog); if unknown, `develop` then `dev` (preferring `origin/`). Never `main`. The summary says which one was used / failures shown in detail (default 10). |
 
 Exit code: 0 when everything passes (or, with `--baseline`, when there are no new failures), 1 otherwise.
@@ -38,7 +39,9 @@ Exit code: 0 when everything passes (or, with `--baseline`, when there are no ne
 - **Never stash, checkout or reset to find out whether a failure is pre-existing.** Use `--baseline`: it runs the merge-base with the base branch in a separate git worktree, leaving the working tree untouched, and caches the result per base commit, so the comparison costs nothing after the first time. Only fix the failures marked as new unless the user asks otherwise; mention the pre-existing ones in your final report. If the base shown is wrong (e.g. `(por defecto)` on a branch stacked on another feature branch), re-run with `--base <branch>`.
 - **Narrow re-runs.** While fixing, re-run only the affected file (`qcheck test -- path/to/file.test.ts`, `qcheck lint -- src/file.ts`). Run `qcheck all` once at the end.
 - **Read the log only when the summary isn't enough** (e.g. a truncated message marked `… (+N líneas)`). Search it instead of reading it whole: `grep -n -A 20 "test name" .git/qcheck/last-test.log`. The JSON reports next to it (`report-test.json`, `report-lint.json`) have every detail.
-- **Crashes** (`terminó sin reporte`, `eslint falló`, `tsc falló`) mean the tool itself couldn't run: config errors, missing deps, syntax errors in config. The summary shows the last lines of output; fix that first.
+- **Give the Bash call room.** Run full suites with the Bash tool's `timeout` at 600000 ms: qcheck stops itself at 540 s and reports why, which is better than being cut off by the tool. For a suite that legitimately takes longer, pass a bigger `--timeout` and run it in the background.
+- **`⚠ … no salía (handles abiertos)`** means the runner finished and wrote its results, but something (a DB connection, a server, a timer) kept the process alive; qcheck stopped it after 10 s. The results shown are valid. Mention it to the user — it usually means a missing `afterAll` cleanup — but don't block on it unless asked.
+- **Crashes** (`terminó sin reporte`, `eslint falló`, `tsc falló`, `no terminó en Ns`) mean the tool itself couldn't run: config errors, missing deps, syntax errors in config. The summary shows the last lines of output; fix that first.
 
 ## Any other noisy command: `qrun`
 
