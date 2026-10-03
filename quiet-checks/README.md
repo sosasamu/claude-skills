@@ -160,6 +160,17 @@ Ejemplos de salida:
 
 La salida indica cuál usó: `(rama de origen)`, `(por defecto)` o `(--base)`. No hace `git fetch`: compara contra tu copia local de `origin/…`.
 
+## Procesos y memoria
+
+Jest, vitest y Playwright abren varios workers (con ts-jest, ~400 MB cada uno). Para que nunca queden huérfanos ocupando RAM:
+
+- Cada comando corre en su **propio grupo de procesos**; al terminar, `qcheck` mata lo que haya quedado del grupo.
+- Si a `qcheck` lo interrumpen (Ctrl+C, timeout del Bash de Claude Code, `SIGTERM`/`SIGHUP`), mata el grupo antes de salir. Si lo matan con `SIGKILL`, un watchdog mínimo en `sh` (~1 MB) lo detecta en ≤1 s y mata el grupo.
+- **Timeout** por check: 540 s por defecto (por debajo del máximo de 10 min del Bash de Claude Code, así el corte lo reporta `qcheck` con el motivo). Configurable con `--timeout <s>` o `QCHECK_TIMEOUT`. El hook al editar usa 100 s (`QCHECK_HOOK_TIMEOUT`).
+- **Runner colgado**: si jest/vitest/Playwright ya escribió los resultados pero el proceso no sale (conexiones a DB, servidores o timers sin cerrar), `qcheck` lo detiene a los 10 s, muestra los resultados igual y avisa con `⚠` cómo encontrar qué quedó abierto.
+
+`qrun` sin `--until` respeta los procesos que el comando deja en background a propósito (`docker compose up -d`, `cmd &`) si terminó bien.
+
 ## Limitaciones conocidas
 
 - Bun y Yarn Plug'n'Play no están soportados (con PnP no hay `node_modules/.bin`).

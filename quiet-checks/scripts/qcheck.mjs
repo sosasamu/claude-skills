@@ -25,6 +25,7 @@ Opciones:
   --base <ref>   Rama base (por defecto: la rama de la que salió la actual, según el reflog;
                  si no se sabe, develop o dev)
   --max <n>      Máximo de fallos a mostrar en detalle (por defecto: 10)
+  --timeout <s>  Corta el check (y todos sus procesos) si tarda más (por defecto: 540, o QCHECK_TIMEOUT)
 
 Salida: una línea por check si pasa; si falla, solo los errores y la ruta del log completo.
 Código de salida: 0 si todo pasa (o, con --baseline, si no hay fallos nuevos); 1 si no.`;
@@ -49,18 +50,142 @@ const TS_EXT = new Set([".ts", ".tsx", ".mts", ".cts"]);
 const MESSAGE_LINES = 12;
 const ANSI = /\x1b\[[0-9;]*m/g;
 const NOISE_FRAME = /node_modules|node:internal|\(node:|<anonymous>/;
+const HANG_GRACE_MS = 10_000;
+const DEFAULT_TIMEOUT_S = 540; // below Claude Code's 10-minute Bash limit, so qcheck reports the timeout itself
 
 // ---------- helpers ----------
 
-function run(cmd, args, cwd, env = {}) {
-  const result = spawnSync(cmd, args, {
-    cwd,
-    encoding: "utf8",
-    maxBuffer: 512 * 1024 * 1024,
-    env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1", ...env },
+// ---------- child processes ----------
+// Every child runs in its own process group so the whole tree (jest/vitest workers, dev servers)
+// can be stopped together: on timeout, when a runner hangs, and when qcheck itself is interrupted
+// (e.g. Claude Code's Bash timeout). Without this, workers outlive qcheck and keep their memory.
+
+const running = new Set();
+
+function killGroup(pid, signal) {
+  try {
+    process.kill(-pid, signal);
+  } catch {}
+}
+
+for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143], ["SIGHUP", 129]]) {
+  process.on(signal, () => {
+    for (const pid of running) killGroup(pid, "SIGKILL");
+    process.exit(code);
   });
-  const out = `${result.stdout ?? ""}${result.stderr ?? ""}${result.error ? `\n${result.error.message}` : ""}`;
-  return { code: result.status ?? 1, out: out.replace(ANSI, "") };
+}
+process.on("exit", () => {
+  for (const pid of running) killGroup(pid, "SIGKILL");
+});
+
+function cleanOutput(text) {
+  // progress bars rewrite the line with \r; keep only what was finally shown
+  return text
+    .replace(ANSI, "")
+    .split("\n")
+    .map((line) => line.split("\r").filter(Boolean).at(-1) ?? "")
+    .join("\n");
+}
+
+// Options:
+//   timeoutMs   stop the group after this long (result.timedOut)
+//   until       regex; stop the group as soon as a line matches (result.matched)
+//   reportFile  test runners write it when the run is over; if the process is still alive
+//               HANG_GRACE_MS later, it's stuck on open handles (DB connections, servers, timers)
+//               and gets stopped (result.hung) — the report is still valid
+//   keepStragglers  don't kill leftover processes of the group after a normal exit (qrun)
+function exec(cmd, args, { cwd, env = {}, timeoutMs = 0, until = null, reportFile = null, keepStragglers = false } = {}) {
+  return new Promise((done) => {
+    const child = spawn(cmd, args, {
+      cwd,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1", ...env },
+    });
+    let out = "";
+    let pending = "";
+    let matched = null;
+    let stopReason = null;
+    let killTimer = null;
+    let finished = false;
+    if (child.pid) {
+      running.add(child.pid);
+      // Signal handlers can't run on SIGKILL. This tiny shell watchdog (also detached) stops the group
+      // if qcheck dies while the command is still running; it exits on its own otherwise.
+      const leader = child.pid;
+      spawn(
+        "sh",
+        ["-c", `while kill -0 ${process.pid} 2>/dev/null && kill -0 ${leader} 2>/dev/null; do sleep 1; done; kill -0 ${process.pid} 2>/dev/null || kill -KILL -- -${leader} 2>/dev/null`],
+        { detached: true, stdio: "ignore" },
+      ).unref();
+    }
+
+    const stop = (reason) => {
+      if (stopReason) return;
+      stopReason = reason;
+      killGroup(child.pid, "SIGTERM");
+      killTimer = setTimeout(() => killGroup(child.pid, "SIGKILL"), 5000);
+    };
+    const onData = (chunk) => {
+      out += chunk;
+      if (!until || matched) return;
+      const lines = (pending + chunk).replace(ANSI, "").split(/\r?\n/);
+      pending = lines.pop();
+      matched = lines.find((line) => until.test(line)) ?? null;
+      if (matched) stop("matched");
+    };
+    child.stdout.setEncoding("utf8").on("data", onData);
+    child.stderr.setEncoding("utf8").on("data", onData);
+
+    const timer = timeoutMs ? setTimeout(() => stop("timeout"), timeoutMs) : null;
+    let reportSeenAt = 0;
+    const poll = reportFile
+      ? setInterval(() => {
+          if (!existsSync(reportFile)) return;
+          reportSeenAt ||= Date.now();
+          if (Date.now() - reportSeenAt > HANG_GRACE_MS) stop("hung");
+        }, 1000)
+      : null;
+
+    const finish = (code) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      clearInterval(poll);
+      if (child.pid) {
+        if (stopReason || !keepStragglers) killGroup(child.pid, "SIGKILL");
+        running.delete(child.pid);
+      }
+      done({
+        code: code ?? 1,
+        out: cleanOutput(out),
+        matched: matched?.trim() ?? null,
+        timedOut: stopReason === "timeout",
+        hung: stopReason === "hung",
+      });
+    };
+    child.on("error", (error) => {
+      out += `\n${error.message}`;
+      if (!child.pid) finish(1);
+    });
+    child.on("close", finish);
+  });
+}
+
+// Explains a check that had to be stopped. Returns null when it ended on its own.
+function stoppedNote(result, ctx, tool) {
+  const hints = {
+    jest: "Para ver qué queda abierto: `-- --detectOpenHandles`.",
+    vitest: "Para ver qué queda abierto: `-- --reporter=hanging-process`.",
+  };
+  if (result.hung) {
+    return `${tool} terminó pero no salía (handles abiertos: DB, servidores, timers); se detuvo. ${hints[tool] ?? ""}`.trim();
+  }
+  if (result.timedOut) {
+    return `${tool} no terminó en ${ctx.timeoutMs / 1000}s; se detuvo junto con sus procesos. Si es lento, usá --timeout <s>; si se colgó, revisá el log. ${hints[tool] ?? ""}`.trim();
+  }
+  return null;
 }
 
 function git(args, cwd) {
@@ -144,7 +269,7 @@ function saveLog(dir, prefix, kind, out) {
 
 // ---------- tests (vitest / jest) ----------
 
-function checkTest(ctx) {
+async function checkTest(ctx) {
   const { cwd, extra, dir, prefix, root } = ctx;
   const { deps, scripts, dir: pkgDir } = readDeps(cwd);
   const report = join(dir, `${prefix}report-test.json`);
@@ -152,9 +277,12 @@ function checkTest(ctx) {
 
   let bin;
   let args;
+  let tool;
   if (deps.has("vitest") && (bin = findBin("vitest", cwd))) {
+    tool = "vitest";
     args = ["run", "--reporter=json", `--outputFile=${report}`, ...extra];
   } else if (deps.has("jest") && (bin = findBin("jest", cwd))) {
+    tool = "jest";
     args = ["--json", `--outputFile=${report}`, ...extra];
   } else if (scripts.test) {
     return checkGeneric(ctx, "test", pkgDir);
@@ -163,14 +291,15 @@ function checkTest(ctx) {
   }
 
   const started = Date.now();
-  const result = run(bin, args, cwd);
+  const result = await exec(bin, args, { cwd, timeoutMs: ctx.timeoutMs, reportFile: report });
   const elapsed = seconds(Date.now() - started);
   const log = saveLog(dir, prefix, "test", result.out);
+  const note = stoppedNote(result, ctx, tool);
 
   if (!existsSync(report)) {
     return {
       kind: "test", ok: false, crashed: true, log, failures: [],
-      headline: `el runner terminó sin reporte (código ${result.code})`,
+      headline: note ?? `el runner terminó sin reporte (código ${result.code})`,
       detail: tail(result.out, 30, ctx.root),
     };
   }
@@ -191,20 +320,20 @@ function checkTest(ctx) {
 
   const passed = data.numPassedTests ?? 0;
   const skipped = (data.numPendingTests ?? 0) + (data.numTodoTests ?? 0);
-  const ok = failures.length === 0 && result.code === 0;
+  const ok = failures.length === 0 && (result.code === 0 || result.hung);
   const parts = [`${passed} pasaron`];
   if (failures.length) parts.unshift(`${failures.length} fallaron`);
   if (skipped) parts.push(`${skipped} omitidos`);
   parts.push(elapsed);
   if (!ok && !failures.length) {
-    return { kind: "test", ok: false, crashed: true, log, failures, headline: `código ${result.code} sin tests fallidos`, detail: tail(result.out, 30, ctx.root) };
+    return { kind: "test", ok: false, crashed: true, log, failures, headline: note ?? `código ${result.code} sin tests fallidos`, detail: tail(result.out, 30, ctx.root) };
   }
-  return { kind: "test", ok, log, failures, headline: parts.join(" · ") };
+  return { kind: "test", ok, log, failures, headline: parts.join(" · "), note };
 }
 
 // ---------- e2e (playwright) ----------
 
-function checkE2e(ctx) {
+async function checkE2e(ctx) {
   const { cwd, extra, dir, prefix, root } = ctx;
   const bin = readDeps(cwd).deps.has("@playwright/test") && findBin("playwright", cwd);
   if (!bin) return { kind: "e2e", ok: true, skipped: true, headline: "sin @playwright/test", failures: [] };
@@ -212,11 +341,17 @@ function checkE2e(ctx) {
   const report = join(dir, `${prefix}report-e2e.json`);
   rmSync(report, { force: true });
   const started = Date.now();
-  const result = run(bin, ["test", "--reporter=json", ...extra], cwd, { PLAYWRIGHT_JSON_OUTPUT_NAME: report });
+  const result = await exec(bin, ["test", "--reporter=json", ...extra], {
+    cwd,
+    env: { PLAYWRIGHT_JSON_OUTPUT_NAME: report },
+    timeoutMs: ctx.timeoutMs,
+    reportFile: report,
+  });
   const elapsed = seconds(Date.now() - started);
   const log = saveLog(dir, prefix, "e2e", result.out);
+  const note = stoppedNote(result, ctx, "playwright");
   if (!existsSync(report)) {
-    return { kind: "e2e", ok: false, crashed: true, log, failures: [], headline: `playwright terminó sin reporte (código ${result.code})`, detail: tail(result.out, 30, root) };
+    return { kind: "e2e", ok: false, crashed: true, log, failures: [], headline: note ?? `playwright terminó sin reporte (código ${result.code})`, detail: tail(result.out, 30, root) };
   }
 
   const data = JSON.parse(readFileSync(report, "utf8"));
@@ -240,7 +375,7 @@ function checkE2e(ctx) {
   for (const fileSuite of data.suites ?? []) walk(fileSuite, []);
 
   const globalErrors = (data.errors ?? []).map((error) => error.message ?? "").join("\n");
-  if (!failures.length && (result.code !== 0 || globalErrors)) {
+  if (!failures.length && ((result.code !== 0 && !result.hung) || globalErrors)) {
     return { kind: "e2e", ok: false, crashed: true, log, failures, headline: `código ${result.code} sin tests fallidos`, detail: trimMessage(globalErrors || result.out.split("\n").slice(-30).join("\n"), root) };
   }
   const stats = data.stats ?? {};
@@ -249,12 +384,12 @@ function checkE2e(ctx) {
   if (stats.flaky) parts.push(`${stats.flaky} flaky`);
   if (stats.skipped) parts.push(`${stats.skipped} omitidos`);
   parts.push(elapsed);
-  return { kind: "e2e", ok: failures.length === 0, log, failures, headline: parts.join(" · ") };
+  return { kind: "e2e", ok: failures.length === 0, log, failures, headline: parts.join(" · "), note };
 }
 
 // ---------- lint (eslint) ----------
 
-function checkLint(ctx) {
+async function checkLint(ctx) {
   const { cwd, extra, dir, prefix, root } = ctx;
   const bin = findBin("eslint", cwd);
   if (!bin) return { kind: "lint", ok: true, skipped: true, headline: "eslint no está instalado", failures: [] };
@@ -262,11 +397,11 @@ function checkLint(ctx) {
   const report = join(dir, `${prefix}report-lint.json`);
   rmSync(report, { force: true });
   const targets = extra.length ? extra : ["."];
-  const result = run(bin, ["--format", "json", "--output-file", report, ...targets], cwd);
+  const result = await exec(bin, ["--format", "json", "--output-file", report, ...targets], { cwd, timeoutMs: ctx.timeoutMs });
   const log = saveLog(dir, prefix, "lint", result.out);
 
   if (!existsSync(report)) {
-    return { kind: "lint", ok: false, crashed: true, log, failures: [], headline: `eslint falló (código ${result.code})`, detail: tail(result.out, 30, ctx.root) };
+    return { kind: "lint", ok: false, crashed: true, log, failures: [], headline: stoppedNote(result, ctx, "eslint") ?? `eslint falló (código ${result.code})`, detail: tail(result.out, 30, ctx.root) };
   }
 
   const files = JSON.parse(readFileSync(report, "utf8"));
@@ -319,16 +454,19 @@ function parseTsc(output, cwd, root) {
   return failures;
 }
 
-function checkTypes(ctx) {
+async function checkTypes(ctx) {
   const { cwd, extra, dir, prefix, root } = ctx;
   const bin = findBin("tsc", cwd);
   if (!bin || !findUp("tsconfig.json", cwd)) {
     return { kind: "types", ok: true, skipped: true, headline: "sin typescript o tsconfig.json", failures: [] };
   }
   const started = Date.now();
-  const result = run(bin, ["--noEmit", "--pretty", "false", ...extra], cwd);
+  const result = await exec(bin, ["--noEmit", "--pretty", "false", ...extra], { cwd, timeoutMs: ctx.timeoutMs });
   const log = saveLog(dir, prefix, "types", result.out);
   const failures = parseTsc(result.out, cwd, root);
+  if (result.timedOut) {
+    return { kind: "types", ok: false, crashed: true, log, failures: [], headline: stoppedNote(result, ctx, "tsc"), detail: tail(result.out, 10, ctx.root) };
+  }
   if (result.code !== 0 && !failures.length) {
     return { kind: "types", ok: false, crashed: true, log, failures, headline: `tsc falló (código ${result.code})`, detail: tail(result.out, 30, ctx.root) };
   }
@@ -338,12 +476,15 @@ function checkTypes(ctx) {
 
 // ---------- fallback: package.json "test" script ----------
 
-function checkGeneric(ctx, kind, pkgDir) {
+async function checkGeneric(ctx, kind, pkgDir) {
   const { dir, prefix, extra } = ctx;
   const pm = packageManager(pkgDir);
   const started = Date.now();
-  const result = run(pm, ["run", kind, ...(extra.length ? ["--", ...extra] : [])], pkgDir);
+  const result = await exec(pm, ["run", kind, ...(extra.length ? ["--", ...extra] : [])], { cwd: pkgDir, timeoutMs: ctx.timeoutMs });
   const log = saveLog(dir, prefix, kind, result.out);
+  if (result.timedOut) {
+    return { kind, ok: false, crashed: true, log, failures: [], headline: stoppedNote(result, ctx, `${pm} run ${kind}`), detail: tail(result.out, 30, ctx.root) };
+  }
   if (result.code === 0) return { kind, ok: true, log, failures: [], headline: `${pm} run ${kind} ok · ${seconds(Date.now() - started)}` };
   return {
     kind, ok: false, crashed: true, generic: true, log, failures: [],
@@ -390,15 +531,16 @@ function defaultBase(cwd) {
   return null;
 }
 
-function installDeps(worktree, dir) {
+async function installDeps(worktree, dir, timeoutMs) {
   const pm = packageManager(worktree);
   const args = {
     pnpm: ["install", "--frozen-lockfile", "--prefer-offline"],
     yarn: ["install", "--frozen-lockfile"],
     npm: ["ci", "--prefer-offline", "--no-audit", "--no-fund"],
   }[pm];
-  const result = run(pm, args, worktree);
+  const result = await exec(pm, args, { cwd: worktree, timeoutMs });
   saveLog(dir, "base-", "install", result.out);
+  if (result.timedOut) return false;
   // pnpm >= 10 exits non-zero when it skips unapproved build scripts even though node_modules is complete
   return result.code === 0 || existsSync(join(worktree, "node_modules", ".modules.yaml"));
 }
@@ -414,13 +556,13 @@ function prepareBase(ctx, baseRef) {
   return ctx.base;
 }
 
-function ensureWorktree(ctx, base) {
+async function ensureWorktree(ctx, base) {
   if (base.ready) return null;
   const { dir, root } = ctx;
   if (existsSync(base.worktree)) git(["worktree", "remove", "--force", base.worktree], root);
   if (git(["worktree", "add", "--detach", base.worktree, base.sha], root) === null) return "no se pudo crear el worktree de la base";
   base.created = true;
-  if (!installDeps(base.worktree, dir)) return `falló la instalación de dependencias en la base (log: ${shortPath(join(dir, "base-last-install.log"), ctx.cwd)})`;
+  if (!(await installDeps(base.worktree, dir, ctx.timeoutMs))) return `falló la instalación de dependencias en la base (log: ${shortPath(join(dir, "base-last-install.log"), ctx.cwd)})`;
   base.ready = true;
   return null;
 }
@@ -429,7 +571,7 @@ function removeWorktree(ctx) {
   if (ctx.base?.created) git(["worktree", "remove", "--force", ctx.base.worktree], ctx.root);
 }
 
-function baselineIds(kind, ctx, baseRef) {
+async function baselineIds(kind, ctx, baseRef) {
   const base = prepareBase(ctx, baseRef);
   if (base.error) return base;
   const { cwd, extra, dir, root } = ctx;
@@ -439,12 +581,12 @@ function baselineIds(kind, ctx, baseRef) {
   const cacheFile = join(cacheDir, `${base.sha.slice(0, 12)}-${key}.json`);
   if (existsSync(cacheFile)) return { ids: new Set(JSON.parse(readFileSync(cacheFile, "utf8"))), label: base.label, cached: true };
 
-  const error = ensureWorktree(ctx, base);
+  const error = await ensureWorktree(ctx, base);
   if (error) {
     base.error = error;
     return base;
   }
-  const result = CHECKS[kind]({ ...ctx, cwd: join(base.worktree, relative(root, cwd)), root: base.worktree, prefix: "base-" });
+  const result = await CHECKS[kind]({ ...ctx, cwd: join(base.worktree, relative(root, cwd)), root: base.worktree, prefix: "base-" });
   if (result.crashed) return { error: `el check no corrió en la base (log: ${shortPath(result.log, ctx.cwd)})` };
   const ids = result.failures.map((failure) => failure.id);
   writeFileSync(cacheFile, JSON.stringify(ids));
@@ -480,14 +622,16 @@ function formatFailures(failures, max) {
   return lines;
 }
 
-function report(result, options, ctx) {
+async function report(result, options, ctx) {
   const pad = result.kind.padEnd(5);
+  const printNote = () => result.note && console.log(`  ⚠ ${result.note}`);
   if (result.skipped) {
     console.log(`- ${pad}  omitido: ${result.headline}`);
     return true;
   }
   if (result.ok) {
     console.log(`✓ ${pad}  ${result.headline}`);
+    printNote();
     return true;
   }
   if (result.crashed) {
@@ -498,13 +642,15 @@ function report(result, options, ctx) {
 
   if (!options.baseline) {
     console.log(`✗ ${pad}  ${result.headline} · log: ${shortPath(result.log, ctx.cwd)}`);
+    printNote();
     formatFailures(result.failures, options.max).forEach((line) => console.log(line));
     return false;
   }
 
-  const base = baselineIds(result.kind, ctx, options.base);
+  const base = await baselineIds(result.kind, ctx, options.base);
   if (base.error) {
     console.log(`✗ ${pad}  ${result.headline} · log: ${shortPath(result.log, ctx.cwd)}`);
+    printNote();
     if (!ctx.baseErrorShown) console.log(`  (sin comparación con la base: ${base.error})`);
     ctx.baseErrorShown = true;
     formatFailures(result.failures, options.max).forEach((line) => console.log(line));
@@ -517,6 +663,7 @@ function report(result, options, ctx) {
   const summary = [`${fresh.length} nuevos`, `${existing.length} ya fallaban en ${base.label}${base.cached ? " (cache)" : ""}`];
   if (fixed) summary.push(`${fixed} arreglados respecto a la base`);
   console.log(`${fresh.length ? "✗" : "~"} ${pad}  ${summary.join(" · ")} · log: ${shortPath(result.log, ctx.cwd)}`);
+  printNote();
   if (fresh.length) {
     console.log("  NUEVOS (causados por los cambios actuales):");
     formatFailures(fresh, options.max).forEach((line) => console.log(line));
@@ -530,7 +677,7 @@ function report(result, options, ctx) {
 
 // ---------- hook (PostToolUse on Edit/Write) ----------
 
-function hook() {
+async function hook() {
   let input = {};
   try {
     input = JSON.parse(readFileSync(0, "utf8") || "{}");
@@ -544,12 +691,14 @@ function hook() {
   const dir = stateDir(cwd);
   const shownRoot = input.cwd ?? projectRoot(cwd);
   const problems = [];
+  // stays under the hook's own timeout in settings.json (120s), so we stop tsc instead of being killed
+  const hookTimeoutMs = (Number(process.env.QCHECK_HOOK_TIMEOUT) || 100) * 1000;
 
   const eslint = findBin("eslint", cwd);
   if (eslint) {
     const reportFile = join(dir, "hook-lint.json");
     rmSync(reportFile, { force: true });
-    run(eslint, ["--format", "json", "--output-file", reportFile, file], cwd);
+    await exec(eslint, ["--format", "json", "--output-file", reportFile, file], { cwd, timeoutMs: hookTimeoutMs });
     if (existsSync(reportFile)) {
       for (const entry of JSON.parse(readFileSync(reportFile, "utf8"))) {
         for (const message of entry.messages) {
@@ -563,7 +712,10 @@ function hook() {
   const tsc = findBin("tsc", cwd);
   if (TS_EXT.has(extname(file)) && tsconfig && tsc && process.env.QCHECK_HOOK_TYPES !== "0") {
     const buildInfo = join(dir, `hook-${createHash("sha1").update(tsconfig).digest("hex").slice(0, 10)}.tsbuildinfo`);
-    const result = run(tsc, ["-p", tsconfig, "--noEmit", "--pretty", "false", "--incremental", "--tsBuildInfoFile", buildInfo], dirname(tsconfig));
+    const result = await exec(tsc, ["-p", tsconfig, "--noEmit", "--pretty", "false", "--incremental", "--tsBuildInfoFile", buildInfo], {
+      cwd: dirname(tsconfig),
+      timeoutMs: hookTimeoutMs,
+    });
     const target = relative(shownRoot, resolve(file));
     for (const failure of parseTsc(result.out, dirname(tsconfig), shownRoot)) {
       if (failure.where.startsWith(`${target}:`)) problems.push(failure.title);
@@ -582,58 +734,8 @@ function hook() {
 const ERROR_LINE = /\b(errors?|failed|failure|fatal|exception|panic|traceback|denied|refused|cannot|unable to|not found)\b|\bERR!|\bERR_\w+|✖|✗|×/i;
 const WARNING_LINE = /\bwarn(ing)?s?\b/i;
 
-function cleanOutput(text) {
-  // progress bars rewrite the line with \r; keep only what was finally shown
-  return text
-    .replace(ANSI, "")
-    .split("\n")
-    .map((line) => line.split("\r").filter(Boolean).at(-1) ?? "")
-    .join("\n");
-}
-
 function shellQuote(arg) {
   return /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`;
-}
-
-function runShell(command, cwd, until, timeoutMs) {
-  return new Promise((done) => {
-    const child = spawn("sh", ["-c", command], {
-      cwd,
-      detached: true, // own process group, so dev servers and their children can be stopped together
-      env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
-    });
-    let out = "";
-    let pending = "";
-    let matched = null;
-    let timedOut = false;
-    let killTimer = null;
-    const stop = () => {
-      try {
-        process.kill(-child.pid, "SIGTERM");
-      } catch {}
-      killTimer = setTimeout(() => {
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch {}
-      }, 5000);
-    };
-    const onData = (chunk) => {
-      out += chunk;
-      if (!until || matched) return;
-      const lines = (pending + chunk).replace(ANSI, "").split(/\r?\n/);
-      pending = lines.pop();
-      matched = lines.find((line) => until.test(line)) ?? null;
-      if (matched) stop();
-    };
-    child.stdout.setEncoding("utf8").on("data", onData);
-    child.stderr.setEncoding("utf8").on("data", onData);
-    const timer = timeoutMs ? setTimeout(() => { timedOut = !matched; stop(); }, timeoutMs) : null;
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      clearTimeout(killTimer);
-      done({ code: code ?? 1, out: cleanOutput(out), matched: matched?.trim(), timedOut });
-    });
-  });
 }
 
 // Collapses runs of identical lines ("tick" ×200) into one.
@@ -689,7 +791,7 @@ async function qrun(argv) {
   const timeoutMs = (timeout ?? (until ? 120 : 0)) * 1000;
 
   const started = Date.now();
-  const result = await runShell(command, cwd, until, timeoutMs);
+  const result = await exec("sh", ["-c", command], { cwd, until, timeoutMs, keepStragglers: true });
   const elapsed = seconds(Date.now() - started);
   const slug = command.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").slice(0, 40) || "cmd";
   const log = shortPath(saveLog(dir, "", `run-${slug}`, result.out), cwd);
@@ -776,7 +878,7 @@ function guard() {
 // ---------- main ----------
 
 function parseArgs(argv) {
-  const options = { baseline: false, base: null, max: 10, extra: [] };
+  const options = { baseline: false, base: null, max: 10, timeout: null, extra: [] };
   const separator = argv.indexOf("--");
   const own = separator === -1 ? argv : argv.slice(0, separator);
   options.extra = separator === -1 ? [] : argv.slice(separator + 1);
@@ -784,6 +886,7 @@ function parseArgs(argv) {
     if (own[i] === "--baseline") options.baseline = true;
     else if (own[i] === "--base") options.base = own[++i];
     else if (own[i] === "--max") options.max = Number(own[++i]) || 10;
+    else if (own[i] === "--timeout") options.timeout = Number(own[++i]) || null;
     else return null;
   }
   return options;
@@ -804,11 +907,12 @@ async function main() {
   }
 
   const cwd = process.cwd();
-  const ctx = { cwd, extra: options.extra, dir: stateDir(cwd), prefix: "", root: projectRoot(cwd) };
+  const timeoutS = options.timeout ?? (Number(process.env.QCHECK_TIMEOUT) || DEFAULT_TIMEOUT_S);
+  const ctx = { cwd, extra: options.extra, dir: stateDir(cwd), prefix: "", root: projectRoot(cwd), timeoutMs: timeoutS * 1000 };
   let ok = true;
   try {
     for (const kind of kinds) {
-      if (!report(CHECKS[kind](ctx), options, ctx)) ok = false;
+      if (!(await report(await CHECKS[kind](ctx), options, ctx))) ok = false;
     }
   } finally {
     removeWorktree(ctx);
